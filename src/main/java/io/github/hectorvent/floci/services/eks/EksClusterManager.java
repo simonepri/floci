@@ -76,6 +76,18 @@ public class EksClusterManager {
     private static final String REGISTRIES_TAR_ENTRY = "rancher/k3s/registries.yaml";
     private static final String ENDPOINT_MODE_NETWORK = "network";
 
+    public static final Map<String, String> SUPPORTED_K8S_VERSIONS = Map.of(
+            "1.28", "rancher/k3s:v1.28.15-k3s1",
+            "1.29", "rancher/k3s:v1.29.14-k3s1",
+            "1.30", "rancher/k3s:v1.30.10-k3s1",
+            "1.31", "rancher/k3s:v1.31.5-k3s1",
+            "1.32", "rancher/k3s:v1.32.2-k3s1",
+            "1.33", "rancher/k3s:v1.33.1-k3s1",
+            "1.34", "rancher/k3s:v1.34.0-k3s1",
+            "1.35", "rancher/k3s:v1.35.0-k3s1",
+            "1.36", "rancher/k3s:v1.36.0-k3s1"
+    );
+
     static final String SA_SIGNING_KEY_FILE = "sa-signing-key.pem";
     static final String SA_PUBLIC_KEY_FILE = "sa-public-key.pem";
     static final String SA_SIGNING_KEY_CONTAINER_PATH = WEBHOOK_CONFIG_DIR + "/" + SA_SIGNING_KEY_FILE;
@@ -187,7 +199,7 @@ public class EksClusterManager {
      * {@link #isReady(Cluster)} returns true and {@link #finalizeCluster(Cluster)} is called.
      */
     public void startCluster(Cluster cluster) {
-        String image = config.services().eks().defaultImage();
+        String image = resolveClusterImage(cluster);
         if (cluster.getDockerName() == null) {
             cluster.setDockerName(accountQualifiedName(cluster));
         }
@@ -217,7 +229,13 @@ public class EksClusterManager {
         // filesystem, so chmod works correctly and data persists across container restarts.
         String volumeName = cluster.getDockerName();
 
-        List<String> serverArgs = buildServerArgs(config.services().eks().disableCni());
+        String serviceCidr = cluster.getKubernetesNetworkConfig() != null
+                && cluster.getKubernetesNetworkConfig().getServiceIpv4Cidr() != null
+                ? cluster.getKubernetesNetworkConfig().getServiceIpv4Cidr()
+                : EksService.DEFAULT_SERVICE_IPV4_CIDR;
+        String clusterCidr = resolvePodCidr(hostPort, config.services().eks().apiServerBasePort(), serviceCidr);
+
+        List<String> serverArgs = buildServerArgs(config.services().eks().disableCni(), serviceCidr, clusterCidr);
 
         // The account label comes from the cluster record when set (restore runs with no request
         // context); regionResolver is the fallback for the create path.
@@ -296,7 +314,13 @@ public class EksClusterManager {
         if (signingKeyFiles != null) {
             copySigningKeysIntoContainer(containerId, signingKeyFiles, cluster.getName());
         }
-        ContainerInfo info = lifecycleManager.startCreated(containerId, spec);
+        ContainerInfo info;
+        try {
+            info = lifecycleManager.startCreated(containerId, spec);
+        } catch (Exception e) {
+            lifecycleManager.removeIfExists(containerName);
+            throw e;
+        }
 
         applyEndpoints(cluster, containerName, hostPort, info);
         configureLinkLocalMetadataEndpoint(cluster, containerId);
@@ -559,11 +583,64 @@ public class EksClusterManager {
     }
 
     /**
+     * Resolves the k3s container image for a cluster.
+     * Uses imageTemplate if configured, otherwise maps supported Kubernetes versions to stable k3s images,
+     * falling back to the configured defaultImage.
+     */
+    String resolveClusterImage(Cluster cluster) {
+        String configuredDefault = config.services().eks().defaultImage();
+        String version = cluster.getVersion();
+        if (version != null && !version.isBlank()) {
+            if (config.services().eks().imageTemplate().isPresent()) {
+                String template = config.services().eks().imageTemplate().get();
+                return template.contains("%s") ? String.format(template, version) : template;
+            }
+            String mapped = SUPPORTED_K8S_VERSIONS.get(version);
+            if (mapped != null) {
+                return mapped;
+            }
+            String normalized = version.startsWith("v") ? version.substring(1) : version;
+            int secondDot = normalized.indexOf('.', normalized.indexOf('.') + 1);
+            if (secondDot > 0) {
+                String majorMinor = normalized.substring(0, secondDot);
+                if (SUPPORTED_K8S_VERSIONS.containsKey(majorMinor)) {
+                    return SUPPORTED_K8S_VERSIONS.get(majorMinor);
+                }
+            }
+            if (normalized.contains("-")) {
+                return "rancher/k3s:v" + normalized;
+            }
+            if (normalized.matches("^1\\.\\d+\\.\\d+$")) {
+                return "rancher/k3s:v" + normalized + "-k3s1";
+            }
+            return "rancher/k3s:v" + normalized + ".0-k3s1";
+        }
+        return configuredDefault != null && !configuredDefault.isBlank()
+                ? configuredDefault
+                : "rancher/k3s:latest";
+    }
+
+    /**
+     * Derives a non-overlapping pod CIDR block for the cluster to prevent routing collisions
+     * when multiple local clusters are running concurrently.
+     */
+    static String resolvePodCidr(int hostPort, int basePort, String serviceCidr) {
+        int offset = Math.max(0, hostPort - basePort);
+        int secondOctet = 42 + (offset * 2);
+        String candidate = "10." + secondOctet + ".0.0/16";
+        if (serviceCidr != null && serviceCidr.startsWith("10." + secondOctet + ".")) {
+            secondOctet += 2;
+            candidate = "10." + secondOctet + ".0.0/16";
+        }
+        return candidate;
+    }
+
+    /**
      * Builds the k3s {@code server} command-line args. When {@code disableCni} is true, flannel,
-     * k3s's default network policy controller, and kube-proxy are all disabled up front — see the
+     * k3s's default network policy controller, and kube-proxy are all disabled up front: see the
      * {@code disableCni} config javadoc for why this must happen at startup, not after the fact.
      */
-    static List<String> buildServerArgs(boolean disableCni) {
+    static List<String> buildServerArgs(boolean disableCni, String serviceCidr, String clusterCidr) {
         List<String> serverArgs = new ArrayList<>(List.of("server",
                 "--disable=traefik",
                 "--tls-san=localhost"));
@@ -572,7 +649,17 @@ public class EksClusterManager {
             serverArgs.add("--disable-network-policy");
             serverArgs.add("--disable-kube-proxy");
         }
+        if (serviceCidr != null && !serviceCidr.isBlank()) {
+            serverArgs.add("--service-cidr=" + serviceCidr);
+        }
+        if (clusterCidr != null && !clusterCidr.isBlank()) {
+            serverArgs.add("--cluster-cidr=" + clusterCidr);
+        }
         return serverArgs;
+    }
+
+    static List<String> buildServerArgs(boolean disableCni) {
+        return buildServerArgs(disableCni, null, null);
     }
 
     /**

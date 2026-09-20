@@ -10,6 +10,7 @@ import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.SecurityGroupPolicy;
 import io.github.hectorvent.floci.services.ec2.model.IpPermission;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
@@ -57,6 +58,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.resource.ResourceProvider;
@@ -428,7 +431,27 @@ public class EksService implements TagHandler, ResourceProvider {
         cluster.setArn(arn);
         cluster.setAccountId(accountId);
         cluster.setCreatedAt(Instant.now());
-        cluster.setVersion(request.getVersion() != null ? request.getVersion() : "1.29");
+
+        if (request.getVersion() != null && !request.getVersion().isBlank()) {
+            String requestedVersion = request.getVersion().trim();
+            Matcher matcher = K8S_VERSION_PATTERN.matcher(requestedVersion);
+            if (!matcher.matches()) {
+                throw new AwsException("InvalidParameterException",
+                        "Invalid Kubernetes version '" + requestedVersion + "'. Version must be in format '1.X'.",
+                        400);
+            }
+            int minor = Integer.parseInt(matcher.group(1));
+            if (minor < MIN_SUPPORTED_K8S_MINOR) {
+                throw new AwsException("InvalidParameterException",
+                        "Unsupported Kubernetes version '" + requestedVersion + "'. Supported versions are 1."
+                                + MIN_SUPPORTED_K8S_MINOR + " and above.",
+                        400);
+            }
+            cluster.setVersion(requestedVersion);
+        } else {
+            cluster.setVersion(DEFAULT_K8S_VERSION);
+        }
+
         cluster.setRoleArn(request.getRoleArn());
         ResourcesVpcConfig vpcConfig = buildVpcConfigResponse(request.getResourcesVpcConfig(), resolvedVpcId);
         SecurityGroup clusterSg = null;
@@ -818,13 +841,27 @@ public class EksService implements TagHandler, ResourceProvider {
         return response;
     }
 
+    public static final String DEFAULT_SERVICE_IPV4_CIDR = "10.100.0.0/16";
+    public static final String DEFAULT_K8S_VERSION = "1.36";
+    public static final Pattern K8S_VERSION_PATTERN = Pattern.compile("^v?1\\.(\\d+)(?:\\.(\\d+))?$");
+    public static final int MIN_SUPPORTED_K8S_MINOR = 28;
+
     private KubernetesNetworkConfig buildNetworkConfig(KubernetesNetworkConfig request) {
         KubernetesNetworkConfig config = new KubernetesNetworkConfig();
         if (request != null) {
-            config.setServiceIpv4Cidr(request.getServiceIpv4Cidr() != null ? request.getServiceIpv4Cidr() : "10.100.0.0/16");
+            String cidr = request.getServiceIpv4Cidr();
+            if (cidr != null && !cidr.isBlank()) {
+                if (!SecurityGroupPolicy.validCidr(cidr)) {
+                    throw new AwsException("InvalidParameterException",
+                            "The specified parameter kubernetesNetworkConfig.serviceIpv4Cidr is not valid: " + cidr, 400);
+                }
+                config.setServiceIpv4Cidr(cidr);
+            } else {
+                config.setServiceIpv4Cidr(DEFAULT_SERVICE_IPV4_CIDR);
+            }
             config.setIpFamily(request.getIpFamily() != null ? request.getIpFamily() : "ipv4");
         } else {
-            config.setServiceIpv4Cidr("10.100.0.0/16");
+            config.setServiceIpv4Cidr(DEFAULT_SERVICE_IPV4_CIDR);
             config.setIpFamily("ipv4");
         }
         return config;
