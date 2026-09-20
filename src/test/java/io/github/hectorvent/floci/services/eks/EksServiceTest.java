@@ -26,6 +26,7 @@ import io.github.hectorvent.floci.services.eks.model.CreateNodeGroupRequest;
 import io.github.hectorvent.floci.services.eks.model.EncryptionConfig;
 import io.github.hectorvent.floci.services.eks.model.FargateProfile;
 import io.github.hectorvent.floci.services.eks.model.FargateProfileStatus;
+import io.github.hectorvent.floci.services.eks.model.KubernetesNetworkConfig;
 import io.github.hectorvent.floci.services.eks.model.Cluster;
 import io.github.hectorvent.floci.services.eks.model.LogSetup;
 import io.github.hectorvent.floci.services.eks.model.Logging;
@@ -1748,5 +1749,56 @@ class EksServiceTest {
         Cluster described = service2.describeCluster("restart-cluster");
         assertEquals(created.getEncryptionConfig(), described.getEncryptionConfig());
         assertEquals(created.getLogging(), described.getLogging());
+    }
+
+    @Test
+    void createClusterWithSupportedVersion() {
+        CreateClusterRequest req = createTestClusterRequest("v30-cluster");
+        req.setVersion("1.30");
+
+        Cluster created = eksService.createCluster(req);
+        assertEquals("1.30", created.getVersion());
+
+        Cluster described = eksService.describeCluster("v30-cluster");
+        assertEquals("1.30", described.getVersion());
+    }
+
+    @Test
+    void createClusterWithUnsupportedVersionThrowsInvalidParameterException() {
+        CreateClusterRequest req = createTestClusterRequest("bad-version-cluster");
+        req.setVersion("1.15");
+
+        AwsException ex = assertThrows(AwsException.class, () -> eksService.createCluster(req));
+        assertEquals("InvalidParameterException", ex.getErrorCode());
+        assertEquals(400, ex.getHttpStatus());
+        assertTrue(ex.getMessage().contains("Unsupported Kubernetes version '1.15'"));
+    }
+
+    @Test
+    void createClusterWithCustomServiceIpv4Cidr() {
+        CreateClusterRequest req = createTestClusterRequest("cidr-cluster");
+        KubernetesNetworkConfig netConfig = new KubernetesNetworkConfig();
+        netConfig.setServiceIpv4Cidr("172.20.0.0/16");
+        req.setKubernetesNetworkConfig(netConfig);
+
+        Cluster created = eksService.createCluster(req);
+        assertNotNull(created.getKubernetesNetworkConfig());
+        assertEquals("172.20.0.0/16", created.getKubernetesNetworkConfig().getServiceIpv4Cidr());
+
+        Cluster described = eksService.describeCluster("cidr-cluster");
+        assertEquals("172.20.0.0/16", described.getKubernetesNetworkConfig().getServiceIpv4Cidr());
+    }
+
+    @Test
+    void createClusterWithInvalidServiceIpv4CidrThrowsInvalidParameterException() {
+        CreateClusterRequest req = createTestClusterRequest("bad-cidr-cluster");
+        KubernetesNetworkConfig netConfig = new KubernetesNetworkConfig();
+        netConfig.setServiceIpv4Cidr("invalid-cidr");
+        req.setKubernetesNetworkConfig(netConfig);
+
+        AwsException ex = assertThrows(AwsException.class, () -> eksService.createCluster(req));
+        assertEquals("InvalidParameterException", ex.getErrorCode());
+        assertEquals(400, ex.getHttpStatus());
+        assertTrue(ex.getMessage().contains("kubernetesNetworkConfig.serviceIpv4Cidr is not valid"));
     }
 }

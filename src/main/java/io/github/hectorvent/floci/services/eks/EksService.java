@@ -10,6 +10,7 @@ import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.SecurityGroupPolicy;
 import io.github.hectorvent.floci.services.ec2.model.IpPermission;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
@@ -428,7 +429,20 @@ public class EksService implements TagHandler, ResourceProvider {
         cluster.setArn(arn);
         cluster.setAccountId(accountId);
         cluster.setCreatedAt(Instant.now());
-        cluster.setVersion(request.getVersion() != null ? request.getVersion() : "1.29");
+
+        if (request.getVersion() != null && !request.getVersion().isBlank()) {
+            String requestedVersion = request.getVersion();
+            if (!EksClusterManager.SUPPORTED_K8S_VERSIONS.containsKey(requestedVersion)) {
+                throw new AwsException("InvalidParameterException",
+                        "Unsupported Kubernetes version '" + requestedVersion + "'. Supported versions are: "
+                                + String.join(", ", EksClusterManager.SUPPORTED_K8S_VERSIONS.keySet().stream().sorted().toList()),
+                        400);
+            }
+            cluster.setVersion(requestedVersion);
+        } else {
+            cluster.setVersion("1.29");
+        }
+
         cluster.setRoleArn(request.getRoleArn());
         ResourcesVpcConfig vpcConfig = buildVpcConfigResponse(request.getResourcesVpcConfig(), resolvedVpcId);
         SecurityGroup clusterSg = null;
@@ -818,13 +832,24 @@ public class EksService implements TagHandler, ResourceProvider {
         return response;
     }
 
+    public static final String DEFAULT_SERVICE_IPV4_CIDR = "10.100.0.0/16";
+
     private KubernetesNetworkConfig buildNetworkConfig(KubernetesNetworkConfig request) {
         KubernetesNetworkConfig config = new KubernetesNetworkConfig();
         if (request != null) {
-            config.setServiceIpv4Cidr(request.getServiceIpv4Cidr() != null ? request.getServiceIpv4Cidr() : "10.100.0.0/16");
+            String cidr = request.getServiceIpv4Cidr();
+            if (cidr != null && !cidr.isBlank()) {
+                if (!SecurityGroupPolicy.validCidr(cidr)) {
+                    throw new AwsException("InvalidParameterException",
+                            "The specified parameter kubernetesNetworkConfig.serviceIpv4Cidr is not valid: " + cidr, 400);
+                }
+                config.setServiceIpv4Cidr(cidr);
+            } else {
+                config.setServiceIpv4Cidr(DEFAULT_SERVICE_IPV4_CIDR);
+            }
             config.setIpFamily(request.getIpFamily() != null ? request.getIpFamily() : "ipv4");
         } else {
-            config.setServiceIpv4Cidr("10.100.0.0/16");
+            config.setServiceIpv4Cidr(DEFAULT_SERVICE_IPV4_CIDR);
             config.setIpFamily("ipv4");
         }
         return config;
