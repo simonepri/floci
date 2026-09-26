@@ -115,6 +115,7 @@ import java.util.Random;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiPredicate;
 import java.util.function.Function;
@@ -252,6 +253,47 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
     private jakarta.enterprise.inject.Instance<ClusterNodeInstanceProvider> clusterNodeInstanceProviders;
     private ClusterNodeInstanceProvider testClusterNodeInstanceProvider;
     private final Ec2VolumeBlockDeviceManager volumeBlockDeviceManager;
+    private jakarta.enterprise.inject.Instance<VpcRouteTableListener> routeTableListenersInstance;
+    private final List<VpcRouteTableListener> routeTableListeners = new CopyOnWriteArrayList<>();
+
+    public void addRouteTableListener(VpcRouteTableListener listener) {
+        if (listener != null && !this.routeTableListeners.contains(listener)) {
+            this.routeTableListeners.add(listener);
+        }
+    }
+
+    public void setRouteTableListener(VpcRouteTableListener listener) {
+        this.routeTableListeners.clear();
+        if (listener != null) {
+            this.routeTableListeners.add(listener);
+        }
+    }
+
+    public boolean attachContainerToVpc(String region, String vpcId, String containerId) {
+        if (vpcNetworkManager != null) {
+            return vpcNetworkManager.attachContainer(region, vpcId, containerId);
+        }
+        return false;
+    }
+
+    private void notifyRouteTableUpdated(String region, RouteTable routeTable) {
+        for (VpcRouteTableListener listener : routeTableListeners) {
+            try {
+                listener.onRouteTableUpdated(region, routeTable);
+            } catch (Exception e) {
+                LOG.warnv("Route table listener failed for {0}: {1}", routeTable.getRouteTableId(), e.getMessage());
+            }
+        }
+        if (routeTableListenersInstance != null && !routeTableListenersInstance.isUnsatisfied()) {
+            for (VpcRouteTableListener listener : routeTableListenersInstance) {
+                try {
+                    listener.onRouteTableUpdated(region, routeTable);
+                } catch (Exception e) {
+                    LOG.warnv("CDI route table listener failed for {0}: {1}", routeTable.getRouteTableId(), e.getMessage());
+                }
+            }
+        }
+    }
 
     void setClusterNodeInstanceProvider(ClusterNodeInstanceProvider provider) {
         this.testClusterNodeInstanceProvider = provider;
@@ -282,7 +324,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
         this.vpcNetworkManager = vpcNetworkManager;
     }
 
-    @Inject
     public Ec2Service(EmulatorConfig config, Ec2ContainerManager containerManager,
                       Ec2PortForwardManager portForwardManager,
                       AmiImageResolver amiImageResolver, Ec2ImageCatalog imageCatalog,
@@ -295,6 +336,23 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
                 instanceTypeCatalog, storageFactory, requestContextInstance, iamService, volumeBlockDeviceManager);
         this.vpcNetworkManager = vpcNetworkManager;
         this.clusterNodeInstanceProviders = clusterNodeInstanceProviders;
+    }
+
+    @Inject
+    public Ec2Service(EmulatorConfig config, Ec2ContainerManager containerManager,
+                      Ec2PortForwardManager portForwardManager,
+                      AmiImageResolver amiImageResolver, Ec2ImageCatalog imageCatalog,
+                      Ec2InstanceTypeCatalog instanceTypeCatalog, StorageFactory storageFactory,
+                      jakarta.enterprise.inject.Instance<RequestContext> requestContextInstance,
+                      VpcNetworkManager vpcNetworkManager, IamService iamService,
+                      jakarta.enterprise.inject.Instance<ClusterNodeInstanceProvider> clusterNodeInstanceProviders,
+                      Ec2VolumeBlockDeviceManager volumeBlockDeviceManager,
+                      jakarta.enterprise.inject.Instance<VpcRouteTableListener> routeTableListenersInstance) {
+        this(config, containerManager, portForwardManager, amiImageResolver, imageCatalog,
+                instanceTypeCatalog, storageFactory, requestContextInstance, iamService, volumeBlockDeviceManager);
+        this.vpcNetworkManager = vpcNetworkManager;
+        this.clusterNodeInstanceProviders = clusterNodeInstanceProviders;
+        this.routeTableListenersInstance = routeTableListenersInstance;
     }
 
     public Ec2Service(EmulatorConfig config, Ec2ContainerManager containerManager,
@@ -7192,6 +7250,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
             next.add(assoc);
             current.setAssociations(next);
             routeTables.put(key(region, routeTableId), current);
+            notifyRouteTableUpdated(region, current);
         }
         return assoc;
     }
@@ -7208,6 +7267,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
                     next.removeIf(a -> a.getRouteTableAssociationId().equals(associationId));
                     current.setAssociations(next);
                     routeTables.put(key(region, current.getRouteTableId()), current);
+                    notifyRouteTableUpdated(region, current);
                 }
             }
         }
@@ -7467,6 +7527,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
             next.add(route);
             current.setRoutes(next);
             routeTables.put(key(region, routeTableId), current);
+            notifyRouteTableUpdated(region, current);
         }
     }
 
@@ -7556,6 +7617,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
             next.set(next.indexOf(existing), replacement);
             current.setRoutes(next);
             routeTables.put(key(region, routeTableId), current);
+            notifyRouteTableUpdated(region, current);
         }
     }
 
@@ -7572,6 +7634,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
                     destinationPrefixListId));
             current.setRoutes(next);
             routeTables.put(key(region, routeTableId), current);
+            notifyRouteTableUpdated(region, current);
         }
     }
 
@@ -8941,7 +9004,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
         );
     }
 
-    // ─── Network Interfaces ─────────────────────────────────────────────────────
+    // ─── Network Interfaces ──────────────────────────────────────────────────────────
+
+    public NetworkInterfaceListResult describeNetworkInterfaces(String region, List<String> networkInterfaceIds,
+                                                                 Map<String, List<String>> filters) {
+        return describeNetworkInterfaces(region, networkInterfaceIds, filters, 0, null);
+    }
 
     public NetworkInterfaceListResult describeNetworkInterfaces(String region, List<String> networkInterfaceIds,
                                                                    Map<String, List<String>> filters,
