@@ -110,10 +110,24 @@ public class Cluster {
     @JsonInclude(JsonInclude.Include.NON_EMPTY)
     private List<String> clusterArgs;
 
+    /**
+     * Managed nodegroups associated with this cluster. Internal persisted metadata
+     * used to derive node labels, taints, and capacity across restarts.
+     * Omitted from AWS API responses by toClusterResponse in EksController.
+     */
+    @JsonProperty("nodegroups")
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    private List<Nodegroup> nodegroups = new ArrayList<>();
+
     private AccessConfig accessConfig;
 
     public AccessConfig getAccessConfig() { return accessConfig; }
     public void setAccessConfig(AccessConfig accessConfig) { this.accessConfig = accessConfig; }
+
+    public List<Nodegroup> getNodegroups() { return nodegroups; }
+    public void setNodegroups(List<Nodegroup> nodegroups) {
+        this.nodegroups = nodegroups != null ? new ArrayList<>(nodegroups) : new ArrayList<>();
+    }
 
     public Cluster() {}
 
@@ -215,6 +229,7 @@ public class Cluster {
         c.dockerName = this.dockerName;
         c.nodeInstanceType = this.nodeInstanceType;
         c.clusterArgs = this.clusterArgs != null ? new ArrayList<>(this.clusterArgs) : null;
+        c.nodegroups = this.nodegroups != null ? new ArrayList<>(this.nodegroups) : null;
         c.accessConfig = this.accessConfig;
         return c;
     }
